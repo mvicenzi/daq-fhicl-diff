@@ -1,0 +1,722 @@
+#!/usr/bin/env python3
+"""Compare two artdaq/FHiCL configurations parameter by parameter.
+
+Unlike a plain `diff`, this resolves `#include` directives through py-fhicl-py,
+so each process configuration is compared as the fully expanded parameter set
+the DAQ would actually see.  Differences are reported layered by *where* the
+value was set -- in a shared `_standard.fcl` base, or as a per-file override --
+so one change in a shared base is reported once rather than once per board.
+Entities are grouped by what the files themselves say: the include graph, or
+the structure of the parameter set for configurations that use no includes.
+
+Usage: daqconf-diff <configA> <configB>
+"""
+
+import argparse
+import glob
+import os
+import re
+import subprocess
+import sys
+from collections import defaultdict
+
+# Files that are configuration metadata rather than process configurations.
+METADATA_FILES = ("schema.fcl", "flags.fcl")
+# hashes.fcl is derived (md5 per file) and flips on whitespace alone.
+SKIPPED_FILES = ("hashes.fcl",)
+
+INCLUDE_RE = re.compile(r'^\s*#include\s+"([^"]+)"', re.MULTILINE)
+
+# Sentinel for "this key is not present at all", distinct from any fhicl value.
+MISSING = object()
+
+SPACK_PACKAGES = "/daq/software/spack_packages"
+
+
+# --------------------------------------------------------------------------
+# Locating the fhicl extension module
+# --------------------------------------------------------------------------
+
+def ensure_fhicl():
+    """Import and return the `fhicl` module, searching known install locations.
+
+    fhicl.so is a CPython extension, so the interpreter's ABI has to match the
+    python it was built against.  It is currently built for 3.9, which is also
+    the system python, so no re-exec is needed -- putting the directory on
+    sys.path is enough.
+    """
+    tried = []
+
+    try:
+        import fhicl
+        return fhicl
+    except ImportError:
+        tried.append("import fhicl (already on sys.path)")
+
+    candidates = []
+
+    override = os.environ.get("PY_FHICL_PY_LIB")
+    if override:
+        candidates.append(override)
+        tried.append("$PY_FHICL_PY_LIB=%s" % override)
+    else:
+        tried.append("$PY_FHICL_PY_LIB (not set)")
+
+    try:
+        prefix = subprocess.run(
+            ["spack", "location", "-i", "py-fhicl-py"],
+            capture_output=True, text=True, timeout=60,
+        ).stdout.strip()
+        if prefix:
+            candidates.append(os.path.join(prefix, "lib"))
+        tried.append("spack location -i py-fhicl-py -> %s" % (prefix or "(failed)"))
+    except (OSError, subprocess.SubprocessError) as exc:
+        tried.append("spack location -i py-fhicl-py -> %s" % exc)
+
+    pattern = os.path.join(SPACK_PACKAGES, "py-fhicl-py", "*", "*", "lib", "fhicl.so")
+    found = sorted(glob.glob(pattern))
+    candidates.extend(os.path.dirname(p) for p in reversed(found))
+    tried.append("%s -> %d match(es)" % (pattern, len(found)))
+
+    for libdir in candidates:
+        if not os.path.exists(os.path.join(libdir, "fhicl.so")):
+            continue
+        sys.path.insert(0, libdir)
+        try:
+            import fhicl
+            return fhicl
+        except ImportError as exc:
+            sys.path.remove(libdir)
+            tried.append("%s -> %s" % (libdir, exc))
+
+    sys.exit(
+        "error: could not import the 'fhicl' module from py-fhicl-py.\n"
+        "Tried:\n  %s\n\n"
+        "Set PY_FHICL_PY_LIB to the directory containing fhicl.so, or run\n"
+        "'spack load py-fhicl-py' first.\n"
+        "Note: fhicl.so is a CPython extension and must match this interpreter's\n"
+        "ABI (%d.%d).  If a newer py-fhicl-py was built against a different python,\n"
+        "run this tool with that interpreter, or fall back to the fhicl-dump CLI in\n"
+        "%s/fhicl-cpp/*/bin/."
+        % ("\n  ".join(tried), sys.version_info[0], sys.version_info[1], SPACK_PACKAGES)
+    )
+
+
+fhicl = None  # populated by main()
+
+
+# --------------------------------------------------------------------------
+# Parsing
+# --------------------------------------------------------------------------
+
+def parse_fcl(path):
+    """Parse one .fcl into a nested dict, resolving #include directives.
+
+    make_pset() resolves its argument against FHICL_FILE_PATH and rejects
+    absolute paths, so the search path is pointed at this file's directory and
+    only the basename is passed.  Only one config directory is ever on the path
+    at a time, otherwise one config's files could satisfy the other's includes.
+    """
+    os.environ["FHICL_FILE_PATH"] = os.path.dirname(os.path.abspath(path))
+    return fhicl.make_pset(os.path.basename(path))
+
+
+def flatten(value, prefix=""):
+    """Flatten a nested pset to {dotted.path: leaf_value}.
+
+    Lists are indexed (`key[0]`); empty tables are kept as leaves so that a
+    table going from empty to populated still registers as a difference.
+    """
+    flat = {}
+    if isinstance(value, dict) and value:
+        for key, sub in value.items():
+            flat.update(flatten(sub, "%s.%s" % (prefix, key) if prefix else key))
+    elif isinstance(value, list) and value:
+        for index, sub in enumerate(value):
+            flat.update(flatten(sub, "%s[%d]" % (prefix, index)))
+    else:
+        flat[prefix] = value
+    return flat
+
+
+def read_includes(path):
+    """Direct #include targets of one file, in file order."""
+    with open(path, "r", errors="replace") as handle:
+        return INCLUDE_RE.findall(handle.read())
+
+
+# --------------------------------------------------------------------------
+# Collections
+# --------------------------------------------------------------------------
+#
+# Groups are inferred from the files themselves, not from schema.fcl.  Two
+# reasons: schema.fcl is absent from some configurations entirely (flat exports
+# such as 12814/), and where it is present it is itself a versioned config file
+# that differs between the two sides being compared -- so using A's patterns to
+# label B's files would be quietly wrong.  Everything it offered is derivable:
+# the include graph reproduces its partition exactly, and the collection names
+# come from the shared base filename.
+
+def base_label(include_name):
+    """'pmt_standard.fcl' -> 'pmt';  'icaruscrt_feb85.fcl' -> 'icaruscrt_feb'."""
+    stem = include_name[:-len(".fcl")] if include_name.endswith(".fcl") else include_name
+    stem = stem.split("_standard")[0] or stem
+    return re.sub(r"\d+$", "", stem) or stem
+
+
+def includes_label(includes):
+    """Name a group after the bases it includes, kept short.
+
+    CRT boards include one fragment per front-end board, so the raw list can run
+    to dozens of names.  Stripping the numbering collapses those to a single
+    stem; anything still unwieldy falls back to the common prefix.
+    """
+    parts = sorted({base_label(i) for i in includes})
+    if len(parts) > 3:
+        return common_prefix(parts) or parts[0]
+    return "+".join(parts)
+
+
+def common_prefix(names):
+    """Longest common prefix of a list of names, trimmed of trailing digits."""
+    if not names:
+        return ""
+    prefix = os.path.commonprefix(names)
+    return re.sub(r"[\d_]+$", "", prefix)
+
+
+def assign_collections(entities):
+    """Group entities, preferring the include graph and falling back to shape.
+
+    Files that include a shared base belong with the others including it.  Files
+    with no includes at all (flat configurations) are grouped by the structure of
+    their parameter set -- boards of the same type have identical key sets -- and
+    named after the longest common filename prefix of the group.
+    """
+    for entity in entities:
+        if entity.includes:
+            entity.collection = includes_label(entity.includes)
+
+    standalone = [e for e in entities if not e.includes]
+    by_shape = defaultdict(list)
+    for entity in standalone:
+        by_shape[frozenset(entity.resolved)].append(entity)
+
+    for group in by_shape.values():
+        label = common_prefix([e.name[:-len(".fcl")] for e in group])
+        if not label:
+            label = group[0].name[:-len(".fcl")] if len(group) == 1 else "Ungrouped"
+        for entity in group:
+            entity.collection = label
+
+
+# --------------------------------------------------------------------------
+# Loading a whole configuration
+# --------------------------------------------------------------------------
+
+class Entity(object):
+    """One process configuration: a root .fcl and its resolved parameters."""
+
+    def __init__(self, name, includes):
+        self.name = name
+        self.includes = includes
+        self.collection = "Ungrouped"   # set by assign_collections()
+        self.resolved = {}      # fully expanded, flattened
+        self.local = {}         # subset set in this file rather than inherited
+
+
+class Config(object):
+    """A parsed configuration directory."""
+
+    def __init__(self, root, label):
+        self.root = root
+        self.label = label
+        self.entities = {}      # basename -> Entity
+        self.bases = {}         # basename -> flattened pset of an included file
+        self.metadata = {}      # basename -> flattened pset
+        self.errors = {}        # basename -> error text
+        self.collisions = []
+
+
+def load_config(root, label):
+    """Walk a config directory and resolve every process configuration in it."""
+    config = Config(root, label)
+
+    all_files = {}
+    for dirpath, _, filenames in os.walk(root):
+        for filename in filenames:
+            if not filename.endswith(".fcl") or filename in SKIPPED_FILES:
+                continue
+            path = os.path.join(dirpath, filename)
+            if filename in all_files:
+                config.collisions.append((filename, all_files[filename], path))
+                continue
+            all_files[filename] = path
+
+    if not all_files:
+        sys.exit("error: no .fcl files found anywhere under '%s'" % root)
+
+    includes = {name: read_includes(path) for name, path in all_files.items()}
+    included = {target for targets in includes.values() for target in targets}
+
+    def parse_flat(name, path):
+        try:
+            return flatten(parse_fcl(path))
+        except Exception as exc:
+            config.errors[name] = str(exc).strip()
+            return None
+
+    # Included fragments form the base layer shared by the files including them.
+    for name in sorted(included):
+        path = all_files.get(name)
+        if path is None:
+            config.errors[name] = "included but not present in the configuration"
+            continue
+        flat = parse_flat(name, path)
+        if flat is not None:
+            config.bases[name] = flat
+
+    for name, path in sorted(all_files.items()):
+        if name in METADATA_FILES:
+            flat = parse_flat(name, path)
+            if flat is not None:
+                config.metadata[name] = flat
+            continue
+        if name in included:
+            continue  # a base layer, compared through the files that include it
+
+        flat = parse_flat(name, path)
+        if flat is None:
+            continue
+
+        direct = [inc for inc in includes[name] if inc in config.bases]
+        entity = Entity(name, direct)
+        entity.resolved = flat
+
+        # Merge the direct includes in file order; fhicl is last-wins, and
+        # transitive includes have already resolved themselves.
+        inherited = {}
+        for inc in direct:
+            inherited.update(config.bases[inc])
+
+        # Value-based, so it stays correct when #include appears mid-file.
+        entity.local = {
+            key: value for key, value in flat.items()
+            if inherited.get(key, MISSING) != value
+        }
+        config.entities[name] = entity
+
+    assign_collections(list(config.entities.values()))
+    return config
+
+
+# --------------------------------------------------------------------------
+# Diffing
+# --------------------------------------------------------------------------
+
+class KeyDiff(object):
+    """Difference for a single parameter between two psets."""
+
+    def __init__(self, key, kind, value_a=None, value_b=None):
+        self.key = key
+        self.kind = kind            # "changed" | "a_only" | "b_only"
+        self.value_a = value_a
+        self.value_b = value_b
+
+
+def diff_psets(flat_a, flat_b):
+    """Three-way compare two flattened psets.
+
+    A key missing from one side is a first-class result, never a value diff
+    against a sentinel.
+    """
+    diffs = []
+    for key in sorted(set(flat_a) | set(flat_b)):
+        in_a, in_b = key in flat_a, key in flat_b
+        if in_a and in_b:
+            if flat_a[key] != flat_b[key]:
+                diffs.append(KeyDiff(key, "changed", flat_a[key], flat_b[key]))
+        elif in_a:
+            diffs.append(KeyDiff(key, "a_only", value_a=flat_a[key]))
+        else:
+            diffs.append(KeyDiff(key, "b_only", value_b=flat_b[key]))
+    return diffs
+
+
+def collapse_subtrees(diffs, flat_a, flat_b):
+    """Fold wholly one-sided subtrees into a single entry.
+
+    Only presence collapses, and only when *every* key under a table is missing
+    from the other side.  A partially-present subtree is left expanded, so a
+    single dropped parameter can never hide inside a collapsed group.
+    """
+    one_sided = [d for d in diffs if d.kind != "changed"]
+    others = [d for d in diffs if d.kind == "changed"]
+    if not one_sided:
+        return diffs
+
+    def subtree_keys(flat, prefix):
+        dotted = prefix + "."
+        indexed = prefix + "["
+        return {k for k in flat if k.startswith(dotted) or k.startswith(indexed)}
+
+    # Candidate roots: every proper ancestor path of a one-sided key.
+    candidates = set()
+    for diff in one_sided:
+        parts = re.split(r"\.|\[", diff.key)
+        for depth in range(1, len(parts)):
+            candidates.add(".".join(parts[:depth]))
+
+    collapsed = []
+    consumed = set()
+    for prefix in sorted(candidates, key=lambda p: (p.count("."), p)):
+        if any(prefix == c or prefix.startswith(c + ".") for c in consumed):
+            continue
+        keys_a = subtree_keys(flat_a, prefix)
+        keys_b = subtree_keys(flat_b, prefix)
+        if keys_a and not keys_b:
+            side, keys = "a_only", keys_a
+        elif keys_b and not keys_a:
+            side, keys = "b_only", keys_b
+        else:
+            continue
+        if len(keys) < 2:
+            continue
+        collapsed.append((prefix, side, sorted(keys)))
+        consumed.add(prefix)
+
+    if not consumed:
+        return diffs
+
+    def is_consumed(key):
+        return any(key.startswith(c + ".") or key.startswith(c + "[") for c in consumed)
+
+    remaining = [d for d in one_sided if not is_consumed(d.key)]
+    return remaining + collapsed + others
+
+
+# --------------------------------------------------------------------------
+# Formatting
+# --------------------------------------------------------------------------
+
+def fmt(value):
+    if isinstance(value, str):
+        return "'%s'" % value
+    return str(value)
+
+
+def collapse_names(names):
+    """Compress ['EventBuilder1', ..., 'EventBuilder12'] to 'EventBuilder1-12'."""
+    groups = defaultdict(list)
+    plain = []
+    for name in names:
+        stem = name[:-len(".fcl")] if name.endswith(".fcl") else name
+        match = re.match(r"^(.*?)(\d+)$", stem)
+        if match:
+            groups[match.group(1)].append((int(match.group(2)), match.group(2)))
+        else:
+            plain.append(stem)
+
+    parts = []
+    for stem in sorted(groups):
+        numbers = sorted(groups[stem])
+        runs = []
+        start = end = None
+        for number, text in numbers:
+            if start is None:
+                start, end = (number, text), (number, text)
+            elif number == end[0] + 1:
+                end = (number, text)
+            else:
+                runs.append((start, end))
+                start, end = (number, text), (number, text)
+        if start is not None:
+            runs.append((start, end))
+        # Render from the original text so zero padding survives (01, not 1).
+        rendered = ",".join(
+            lo[1] if lo[0] == hi[0] else "%s-%s" % (lo[1], hi[1]) for lo, hi in runs
+        )
+        parts.append("%s%s" % (stem, rendered))
+    return ", ".join(sorted(plain) + parts)
+
+
+def render_diffs(diffs, indent, out):
+    """Print one-sided parameters first, then changed values."""
+    order = {"a_only": 0, "b_only": 1, "changed": 2}
+
+    def sort_key(diff):
+        if isinstance(diff, tuple):
+            return (order[diff[1]], diff[0])
+        return (order[diff.kind], diff.key)
+
+    width = 0
+    for diff in diffs:
+        if not isinstance(diff, tuple) and diff.kind == "changed":
+            width = max(width, len(diff.key))
+    width = min(width, 60)
+
+    for diff in sorted(diffs, key=sort_key):
+        if isinstance(diff, tuple):
+            prefix, side, keys = diff
+            leaves = [k[len(prefix) + 1:] for k in keys]
+            shown = ", ".join(leaves[:3])
+            if len(leaves) > 3:
+                shown += ", +%d" % (len(leaves) - 3)
+            out("%s[%s only] subtree %s  (%d keys: %s)"
+                % (indent, side[0].upper(), prefix, len(keys), shown))
+        elif diff.kind == "a_only":
+            out("%s[A only] %s = %s" % (indent, diff.key, fmt(diff.value_a)))
+        elif diff.kind == "b_only":
+            out("%s[B only] %s = %s" % (indent, diff.key, fmt(diff.value_b)))
+        else:
+            out("%s%s  %s -> %s"
+                % (indent, diff.key.ljust(width), fmt(diff.value_a), fmt(diff.value_b)))
+
+
+def tally(diffs):
+    counts = {"changed": 0, "a_only": 0, "b_only": 0}
+    for diff in diffs:
+        if isinstance(diff, tuple):
+            counts[diff[1]] += len(diff[2])
+        else:
+            counts[diff.kind] += 1
+    return counts
+
+
+# --------------------------------------------------------------------------
+# Report
+# --------------------------------------------------------------------------
+
+def compare(config_a, config_b, out):
+    """Compare two loaded configs, writing the report through `out`."""
+    found_any = False
+
+    out("=" * 72)
+    out("  A = %s" % config_a.label)
+    out("      %s" % os.path.abspath(config_a.root))
+    out("  B = %s" % config_b.label)
+    out("      %s" % os.path.abspath(config_b.root))
+    out("")
+    out("  All differences read  A -> B.")
+    out("  [A only] = present in A, absent from B.")
+    out("=" * 72)
+
+    for config, letter in ((config_a, "A"), (config_b, "B")):
+        for name, first, second in config.collisions:
+            out("")
+            out("warning: %s: '%s' appears more than once; using %s, ignoring %s"
+                % (letter, name, first, second))
+
+    common = sorted(set(config_a.entities) & set(config_b.entities))
+
+    # Group by the collection inferred for A, falling back to B's when A could
+    # not name one (a standalone file with no peers to share a prefix with).
+    by_collection = defaultdict(list)
+    for name in common:
+        collection = config_a.entities[name].collection
+        if collection == "Ungrouped":
+            collection = config_b.entities[name].collection
+        by_collection[collection].append(name)
+
+    for collection in sorted(by_collection):
+        names = by_collection[collection]
+        section = []
+        counts = {"changed": 0, "a_only": 0, "b_only": 0}
+
+        # ---- base layer: diff each shared include once ----
+        base_names = sorted({
+            inc
+            for name in names
+            for inc in config_a.entities[name].includes
+            if inc in config_b.bases
+        })
+        for base in base_names:
+            users = [n for n in names if base in config_a.entities[n].includes]
+            diffs = diff_psets(config_a.bases[base], config_b.bases[base])
+            diffs = collapse_subtrees(diffs, config_a.bases[base], config_b.bases[base])
+            if not diffs:
+                continue
+            section.append(" [base] %s   (applies to %d entit%s unless overridden)"
+                           % (base, len(users), "y" if len(users) == 1 else "ies"))
+            render_diffs(diffs, "    ", section.append)
+            section.append("")
+            for kind, value in tally(diffs).items():
+                counts[kind] += value
+
+        # ---- base file swapped between configs ----
+        for name in names:
+            inc_a = set(config_a.entities[name].includes)
+            inc_b = set(config_b.entities[name].includes)
+            if inc_a != inc_b:
+                section.append(" [base] %s: includes %s -> %s   (base file differs)"
+                               % (name,
+                                  ", ".join(sorted(inc_a)) or "(none)",
+                                  ", ".join(sorted(inc_b)) or "(none)"))
+
+        # ---- local overrides, grouped by key then by value pair ----
+        # key -> (kind, value_a, value_b) -> [entity names]
+        buckets = defaultdict(lambda: defaultdict(list))
+        base_changed = set()
+        for base in base_names:
+            for diff in diff_psets(config_a.bases[base], config_b.bases[base]):
+                base_changed.add(diff.key)
+
+        for name in names:
+            entity_a, entity_b = config_a.entities[name], config_b.entities[name]
+            has_base = bool(entity_a.includes or entity_b.includes)
+
+            raw = []
+            for key in set(entity_a.local) | set(entity_b.local):
+                value_a = entity_a.local.get(key, MISSING)
+                value_b = entity_b.local.get(key, MISSING)
+                if value_a is MISSING:
+                    # Set locally in B only.  Normally that is noise when A ends
+                    # up at the same effective value via its base -- but not when
+                    # the base itself changed for this key: then the local pin is
+                    # what stops the base change from reaching this entity, and
+                    # hiding it would make the [base] line above read as applying
+                    # to entities it does not actually reach.
+                    if key not in base_changed \
+                            and entity_a.resolved.get(key, MISSING) == value_b:
+                        continue
+                    raw.append(KeyDiff(key, "b_only", value_b=value_b))
+                elif value_b is MISSING:
+                    if key not in base_changed \
+                            and entity_b.resolved.get(key, MISSING) == value_a:
+                        continue
+                    raw.append(KeyDiff(key, "a_only", value_a=value_a))
+                elif value_a != value_b:
+                    raw.append(KeyDiff(key, "changed", value_a, value_b))
+
+            # Collapse wholly one-sided subtrees here too, so a 150-element
+            # host_map present on one side is one line rather than 300.
+            for item in collapse_subtrees(raw, entity_a.local, entity_b.local):
+                if isinstance(item, tuple):
+                    prefix, side, keys = item
+                    buckets[prefix][("subtree", side, len(keys))].append(name)
+                else:
+                    buckets[item.key][
+                        (item.kind, item.value_a, item.value_b, has_base)
+                    ].append(name)
+
+        if buckets:
+            section.append(" [local overrides]")
+            for key in sorted(buckets):
+                section.append("    %s" % key)
+                for bucket, files in sorted(
+                    buckets[key].items(), key=lambda item: -len(item[1])
+                ):
+                    who = collapse_names(sorted(files))
+                    flag = "        ! masks base" if key in base_changed else ""
+                    if bucket[0] == "subtree":
+                        _, side, size = bucket
+                        section.append("       [%s only] %s   subtree, %d keys%s"
+                                       % (side[0].upper(), who, size, flag))
+                        counts[side] += size * len(files)
+                        continue
+                    kind, value_a, value_b, has_base = bucket
+                    if kind == "changed":
+                        section.append("       %s   %s -> %s%s"
+                                       % (who, fmt(value_a), fmt(value_b), flag))
+                    else:
+                        value = value_a if kind == "a_only" else value_b
+                        other = "B" if kind == "a_only" else "A"
+                        note = "   (%s inherits from base)" % other if has_base else ""
+                        section.append("       [%s only] %s = %s%s%s"
+                                       % (kind[0].upper(), who, fmt(value), note, flag))
+                    counts[kind] += len(files)
+            section.append("")
+
+        if not section:
+            continue
+
+        found_any = True
+        out("")
+        out("%s -- %d entit%s" % (collection, len(names), "y" if len(names) == 1 else "ies"))
+        out("")
+        for line in section:
+            out(line)
+        out("    %s: %d changed, %d A-only, %d B-only across %d entit%s"
+            % (collection, counts["changed"], counts["a_only"], counts["b_only"],
+               len(names), "y" if len(names) == 1 else "ies"))
+
+    # ---- inventory: whole files present on one side only ----
+    for config, other, letter in ((config_a, config_b, "A"), (config_b, config_a, "B")):
+        extra = sorted(set(config.entities) - set(other.entities))
+        out("")
+        out("Only in %s (%s): %d file%s"
+            % (letter, config.label, len(extra), "" if len(extra) == 1 else "s"))
+        if extra:
+            found_any = True
+            grouped = defaultdict(list)
+            for name in extra:
+                grouped[config.entities[name].collection].append(name)
+            for collection in sorted(grouped):
+                out("    %-24s %s  (%d)"
+                    % (collection, collapse_names(sorted(grouped[collection])),
+                       len(grouped[collection])))
+
+    # ---- metadata ----
+    meta_lines = []
+    for name in sorted(set(config_a.metadata) | set(config_b.metadata)):
+        flat_a = config_a.metadata.get(name)
+        flat_b = config_b.metadata.get(name)
+        if flat_a is None or flat_b is None:
+            meta_lines.append("    %s: present only in %s"
+                              % (name, "A" if flat_b is None else "B"))
+            continue
+        diffs = collapse_subtrees(diff_psets(flat_a, flat_b), flat_a, flat_b)
+        if diffs:
+            meta_lines.append("    %s" % name)
+            render_diffs(diffs, "       ", meta_lines.append)
+    if meta_lines:
+        found_any = True
+        out("")
+        out("Configuration metadata")
+        for line in meta_lines:
+            out(line)
+
+    # ---- parse errors ----
+    for config, letter in ((config_a, "A"), (config_b, "B")):
+        if not config.errors:
+            continue
+        out("")
+        out("Parse errors in %s (%s): %d" % (letter, config.label, len(config.errors)))
+        for name in sorted(config.errors):
+            out("    %s: %s" % (name, config.errors[name].replace("\n", " ")))
+
+    if not found_any:
+        out("")
+        out("No differences.")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Compare two artdaq/FHiCL configuration directories.",
+        epilog="Pass the top-level configuration directories; the .fcl files "
+               "are found recursively, so nested and flat layouts both work.",
+    )
+    parser.add_argument("config_a", help="configuration directory A")
+    parser.add_argument("config_b", help="configuration directory B")
+    parser.add_argument("--label-a", help="display name for A (default: directory name)")
+    parser.add_argument("--label-b", help="display name for B (default: directory name)")
+    args = parser.parse_args()
+
+    for path in (args.config_a, args.config_b):
+        if not os.path.isdir(path):
+            sys.exit("error: not a directory: '%s'" % path)
+
+    global fhicl
+    fhicl = ensure_fhicl()
+
+    def label_for(path, override):
+        return override or os.path.basename(os.path.abspath(path.rstrip("/")))
+
+    config_a = load_config(args.config_a, label_for(args.config_a, args.label_a))
+    config_b = load_config(args.config_b, label_for(args.config_b, args.label_b))
+
+    compare(config_a, config_b, lambda line: print(line))
+
+
+if __name__ == "__main__":
+    main()
