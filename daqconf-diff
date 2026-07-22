@@ -13,6 +13,7 @@ Usage: daqconf-diff <configA> <configB>
 """
 
 import argparse
+import difflib
 import glob
 import os
 import re
@@ -404,6 +405,57 @@ def fmt(value):
     return str(value)
 
 
+# Strings at or above this length (or any multiline string) are diffed
+# character by character instead of printed in full on both sides.
+LONG_STRING = 50
+CONTEXT = 15  # chars of unchanged context kept on each side of a change
+
+
+def _vis(text):
+    """Make whitespace visible: space, newline, tab become printable marks."""
+    return text.replace(" ", "·").replace("\n", "↵").replace("\t", "→")
+
+
+def summarize_change(value_a, value_b):
+    """Compact character-level diff of a long/multiline string change.
+
+    Returns an inline string showing only the changed spans with a little
+    surrounding context, unchanged runs elided to a single ellipsis.  Returns
+    None when the values are not both long strings, so the caller falls back to
+    a plain 'a -> b'.
+
+    Markers: [+x] inserted, [-x] removed, [-a|+b] replaced;
+    middot=space, return-arrow=newline, right-arrow=tab, ellipsis=elided run.
+    """
+    if not (isinstance(value_a, str) and isinstance(value_b, str)):
+        return None
+    if "\n" not in value_a and "\n" not in value_b \
+            and len(value_a) < LONG_STRING and len(value_b) < LONG_STRING:
+        return None
+
+    ops = difflib.SequenceMatcher(None, value_a, value_b, autojunk=False).get_opcodes()
+    out = []
+    for idx, (tag, i1, i2, j1, j2) in enumerate(ops):
+        if tag == "equal":
+            run = value_a[i1:i2]
+            first, last = idx == 0, idx == len(ops) - 1
+            if len(run) <= 2 * CONTEXT:
+                out.append(_vis(run))
+            elif first:
+                out.append("…" + _vis(run[-CONTEXT:]))
+            elif last:
+                out.append(_vis(run[:CONTEXT]) + "…")
+            else:
+                out.append(_vis(run[:CONTEXT]) + "…" + _vis(run[-CONTEXT:]))
+        elif tag == "delete":
+            out.append("[-%s]" % _vis(value_a[i1:i2]))
+        elif tag == "insert":
+            out.append("[+%s]" % _vis(value_b[j1:j2]))
+        else:  # replace
+            out.append("[-%s|+%s]" % (_vis(value_a[i1:i2]), _vis(value_b[j1:j2])))
+    return "".join(out)
+
+
 def collapse_names(names):
     """Compress ['EventBuilder1', ..., 'EventBuilder12'] to 'EventBuilder1-12'."""
     groups = defaultdict(list)
@@ -468,8 +520,12 @@ def render_diffs(diffs, indent, out):
         elif diff.kind == "b_only":
             out("%s[B only] %s = %s" % (indent, diff.key, fmt(diff.value_b)))
         else:
-            out("%s%s  %s -> %s"
-                % (indent, diff.key.ljust(width), fmt(diff.value_a), fmt(diff.value_b)))
+            summary = summarize_change(diff.value_a, diff.value_b)
+            if summary is None:
+                out("%s%s  %s -> %s"
+                    % (indent, diff.key.ljust(width), fmt(diff.value_a), fmt(diff.value_b)))
+            else:
+                out("%s%s  %s" % (indent, diff.key.ljust(width), summary))
 
 
 def tally(diffs):
@@ -615,8 +671,12 @@ def compare(config_a, config_b, out):
                         continue
                     kind, value_a, value_b, has_base = bucket
                     if kind == "changed":
-                        section.append("       %s   %s -> %s%s"
-                                       % (who, fmt(value_a), fmt(value_b), flag))
+                        summary = summarize_change(value_a, value_b)
+                        if summary is None:
+                            section.append("       %s   %s -> %s%s"
+                                           % (who, fmt(value_a), fmt(value_b), flag))
+                        else:
+                            section.append("       %s   %s%s" % (who, summary, flag))
                     else:
                         value = value_a if kind == "a_only" else value_b
                         other = "B" if kind == "a_only" else "A"
