@@ -568,14 +568,16 @@ def render_diffs(diffs, indent, out, provenance=None):
         elif diff.kind == "b_only":
             out("%s[B only] %s = %s" % (indent, diff.key, fmt(diff.value_b)))
         else:
-            note = provenance.get(diff.key, "")
             summary = summarize_change(diff.value_a, diff.value_b)
             if summary is None:
-                out("%s%s  %s -> %s%s"
+                out("%s%s  %s -> %s"
                     % (indent, diff.key.ljust(width),
-                       fmt(diff.value_a), fmt(diff.value_b), note))
+                       fmt(diff.value_a), fmt(diff.value_b)))
             else:
-                out("%s%s  %s%s" % (indent, diff.key.ljust(width), summary, note))
+                out("%s%s  %s" % (indent, diff.key.ljust(width), summary))
+            note = provenance.get(diff.key)
+            if note:
+                out("%s    %s" % (indent, note))
 
 
 def tally(diffs):
@@ -675,18 +677,16 @@ def compare(config_a, config_b, out):
                     and changed_by_key.get(source_key) == transition:
                 suppressed.add(source_key)
                 where = block_file.get(source_path.split(".")[0])
-                provenance[key] = "   (via @local::%s%s)" % (
+                provenance[key] = "(via @local::%s%s)" % (
                     source_path, " in " + where if where else "")
 
         for base in base_names:
-            users = [n for n in names if base in config_a.entities[n].includes]
             diffs = diff_psets(config_a.bases[base], config_b.bases[base])
             diffs = [d for d in diffs if d.key not in suppressed]
             diffs = collapse_subtrees(diffs, config_a.bases[base], config_b.bases[base])
             if not diffs:
                 continue
-            section.append(" [base] %s   (applies to %d entit%s unless overridden)"
-                           % (base, len(users), "y" if len(users) == 1 else "ies"))
+            section.append(" [base] %s" % base)
             render_diffs(diffs, "    ", section.append, provenance)
             section.append("")
             for kind, value in tally(diffs).items():
@@ -767,13 +767,15 @@ def compare(config_a, config_b, out):
                         continue
                     kind, value_a, value_b, has_base = bucket
                     if kind == "changed":
-                        prov = provenance.get(key, "")
                         summary = summarize_change(value_a, value_b)
                         if summary is None:
-                            section.append("       %s   %s -> %s%s%s"
-                                           % (who, fmt(value_a), fmt(value_b), flag, prov))
+                            section.append("       %s   %s -> %s%s"
+                                           % (who, fmt(value_a), fmt(value_b), flag))
                         else:
-                            section.append("       %s   %s%s%s" % (who, summary, flag, prov))
+                            section.append("       %s   %s%s" % (who, summary, flag))
+                        prov = provenance.get(key)
+                        if prov:
+                            section.append("          %s" % prov)
                     else:
                         value = value_a if kind == "a_only" else value_b
                         other = "B" if kind == "a_only" else "A"
@@ -792,9 +794,8 @@ def compare(config_a, config_b, out):
         out("")
         for line in section:
             out(line)
-        out("    %s: %d changed, %d A-only, %d B-only across %d entit%s"
-            % (collection, counts["changed"], counts["a_only"], counts["b_only"],
-               len(names), "y" if len(names) == 1 else "ies"))
+        out("    summary: %d changed, %d A-only, %d B-only"
+            % (counts["changed"], counts["a_only"], counts["b_only"]))
 
     # ---- inventory: whole files present on one side only ----
     for config, other, letter in ((config_a, config_b, "A"), (config_b, config_a, "B")):
