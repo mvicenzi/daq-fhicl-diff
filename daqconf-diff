@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Compare two artdaq/FHiCL configurations parameter by parameter.
 
-Unlike a plain `diff`, this resolves `#include` directives through py-fhicl-py,
+Unlike a plain `diff`, this resolves `#include` directives through `fhicl-py`,
 so each process configuration is compared as the fully expanded parameter set
-the DAQ would actually see.  Differences are reported layered by *where* the
-value was set -- in a shared `_standard.fcl` base, or as a per-file override --
-so one change in a shared base is reported once rather than once per board.
+the DAQ would actually see.  Differences are reported layered by where the
+value was set, whether in a shared `_standard.fcl` base or as a per-file override.
+One change in a shared base is reported once rather than once per board.
 Entities are grouped by what the files themselves say: the include graph, or
 the structure of the parameter set for configurations that use no includes.
 
@@ -22,14 +22,15 @@ from collections import defaultdict
 
 # Files that are configuration metadata rather than process configurations.
 METADATA_FILES = ("schema.fcl", "flags.fcl")
-# hashes.fcl is derived (md5 per file) and flips on whitespace alone.
 SKIPPED_FILES = ("hashes.fcl",)
 
+# Regex to find `#include "..."` directives, ignoring leading whitespace.
 INCLUDE_RE = re.compile(r'^\s*#include\s+"([^"]+)"', re.MULTILINE)
 
 # Sentinel for "this key is not present at all", distinct from any fhicl value.
 MISSING = object()
 
+# Location of the spack_packages directory, which is where fhicl.so is installed.
 SPACK_PACKAGES = "/daq/software/spack_packages"
 
 
@@ -42,7 +43,7 @@ def ensure_fhicl():
 
     fhicl.so is a CPython extension, so the interpreter's ABI has to match the
     python it was built against.  It is currently built for 3.9, which is also
-    the system python, so no re-exec is needed -- putting the directory on
+    the system python, so no re-exec is needed and putting the directory on
     sys.path is enough.
     """
     tried = []
@@ -96,9 +97,8 @@ def ensure_fhicl():
         "'spack load py-fhicl-py' first.\n"
         "Note: fhicl.so is a CPython extension and must match this interpreter's\n"
         "ABI (%d.%d).  If a newer py-fhicl-py was built against a different python,\n"
-        "run this tool with that interpreter, or fall back to the fhicl-dump CLI in\n"
-        "%s/fhicl-cpp/*/bin/."
-        % ("\n  ".join(tried), sys.version_info[0], sys.version_info[1], SPACK_PACKAGES)
+        "run this tool with that interpreter."
+        % ("\n  ".join(tried), sys.version_info[0], sys.version_info[1])
     )
 
 
@@ -150,11 +150,11 @@ def read_includes(path):
 # --------------------------------------------------------------------------
 #
 # Groups are inferred from the files themselves, not from schema.fcl.  Two
-# reasons: schema.fcl is absent from some configurations entirely (flat exports
-# such as 12814/), and where it is present it is itself a versioned config file
-# that differs between the two sides being compared -- so using A's patterns to
-# label B's files would be quietly wrong.  Everything it offered is derivable:
-# the include graph reproduces its partition exactly, and the collection names
+# reasons: schema.fcl is absent from some configurations entirely (like run_records),
+# and where it is present it is itself a versioned config file
+# that might differ between the two sides being compared.
+# Everything it offered is derivable: the include graph reproduces
+# its partition exactly, and the collection names
 # come from the shared base filename.
 
 def base_label(include_name):
@@ -190,8 +190,7 @@ def assign_collections(entities):
 
     Files that include a shared base belong with the others including it.  Files
     with no includes at all (flat configurations) are grouped by the structure of
-    their parameter set -- boards of the same type have identical key sets -- and
-    named after the longest common filename prefix of the group.
+    their parameter set and named after the longest common filename prefix of the group.
     """
     for entity in entities:
         if entity.includes:
@@ -346,7 +345,7 @@ def diff_psets(flat_a, flat_b):
 def collapse_subtrees(diffs, flat_a, flat_b):
     """Fold wholly one-sided subtrees into a single entry.
 
-    Only presence collapses, and only when *every* key under a table is missing
+    Only presence collapses, and only when every key under a table is missing
     from the other side.  A partially-present subtree is left expanded, so a
     single dropped parameter can never hide inside a collapsed group.
     """
@@ -700,6 +699,8 @@ def main():
     parser.add_argument("config_b", help="configuration directory B")
     parser.add_argument("--label-a", help="display name for A (default: directory name)")
     parser.add_argument("--label-b", help="display name for B (default: directory name)")
+    parser.add_argument("-o", "--output", metavar="FILE",
+                        help="write the report to FILE instead of stdout")
     args = parser.parse_args()
 
     for path in (args.config_a, args.config_b):
@@ -715,7 +716,16 @@ def main():
     config_a = load_config(args.config_a, label_for(args.config_a, args.label_a))
     config_b = load_config(args.config_b, label_for(args.config_b, args.label_b))
 
-    compare(config_a, config_b, lambda line: print(line))
+    if args.output:
+        try:
+            handle = open(args.output, "w")
+        except OSError as exc:
+            sys.exit("error: cannot write to '%s': %s" % (args.output, exc))
+        with handle:
+            compare(config_a, config_b, lambda line: handle.write(line + "\n"))
+        print("wrote report to %s" % args.output, file=sys.stderr)
+    else:
+        compare(config_a, config_b, print)
 
 
 if __name__ == "__main__":
