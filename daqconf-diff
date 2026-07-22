@@ -28,6 +28,13 @@ SKIPPED_FILES = ("hashes.fcl",)
 # Regex to find `#include "..."` directives, ignoring leading whitespace.
 INCLUDE_RE = re.compile(r'^\s*#include\s+"([^"]+)"', re.MULTILINE)
 
+# Regex for `target: @local::source` bindings.  None of these configs wrap
+# their definitions in BEGIN_PROLOG, so a block defined at `source` survives
+# resolution *and* is copied to `target` -- the same value ends up at two
+# paths.  Recording the binding lets the diff report that change once, on the
+# consumed path, instead of once per path.
+LOCAL_REF_RE = re.compile(r'^\s*([\w.]+)\s*:\s*@local::([\w.]+)', re.MULTILINE)
+
 # Sentinel for "this key is not present at all", distinct from any fhicl value.
 MISSING = object()
 
@@ -146,6 +153,38 @@ def read_includes(path):
         return INCLUDE_RE.findall(handle.read())
 
 
+def read_local_refs(path):
+    """`(target, source)` pairs for every `target: @local::source` in a file."""
+    with open(path, "r", errors="replace") as handle:
+        return LOCAL_REF_RE.findall(handle.read())
+
+
+def mirror_source(key, bindings):
+    """Map a consumed key to the `@local::` source key it was copied from.
+
+    E.g. `daq.fragment_receiver.fpga_init_params.MajLevelBeamCryo1.value` maps
+    to `fpga_init_pars.MajLevelBeamCryo1.value` given the binding
+    `fpga_init_params: @local::fpga_init_pars`.  The target is often written
+    unqualified inside a nested table, so it is matched as a path *component* of
+    `key` rather than a full prefix.  When several bindings match, the longest
+    (most specific) target wins.  Returns `(source_key, source_path)` or
+    `(None, None)`.
+    """
+    padded = "." + key
+    best = None
+    for target, source in bindings:
+        needle = "." + target.split(".")[-1] + "."
+        index = padded.find(needle)
+        if index == -1:
+            continue
+        if best is None or len(target) > best[0]:
+            suffix = padded[index + len(needle):]
+            best = (len(target), source + "." + suffix, source)
+    if best is None:
+        return None, None
+    return best[1], best[2]
+
+
 # --------------------------------------------------------------------------
 # Collections
 # --------------------------------------------------------------------------
@@ -236,6 +275,7 @@ class Config(object):
         self.metadata = {}      # basename -> flattened pset
         self.errors = {}        # basename -> error text
         self.collisions = []
+        self.local_refs = set()  # (target, source) from `t: @local::s` bindings
 
 
 def load_config(root, label):
@@ -258,6 +298,9 @@ def load_config(root, label):
 
     includes = {name: read_includes(path) for name, path in all_files.items()}
     included = {target for targets in includes.values() for target in targets}
+
+    for path in all_files.values():
+        config.local_refs.update(read_local_refs(path))
 
     def parse_flat(name, path):
         try:
@@ -491,8 +534,13 @@ def collapse_names(names):
     return ", ".join(sorted(plain) + parts)
 
 
-def render_diffs(diffs, indent, out):
-    """Print one-sided parameters first, then changed values."""
+def render_diffs(diffs, indent, out, provenance=None):
+    """Print one-sided parameters first, then changed values.
+
+    `provenance` maps a key to a note appended after its changed line, used to
+    show where a `@local::`-copied value originates.
+    """
+    provenance = provenance or {}
     order = {"a_only": 0, "b_only": 1, "changed": 2}
 
     def sort_key(diff):
@@ -520,12 +568,14 @@ def render_diffs(diffs, indent, out):
         elif diff.kind == "b_only":
             out("%s[B only] %s = %s" % (indent, diff.key, fmt(diff.value_b)))
         else:
+            note = provenance.get(diff.key, "")
             summary = summarize_change(diff.value_a, diff.value_b)
             if summary is None:
-                out("%s%s  %s -> %s"
-                    % (indent, diff.key.ljust(width), fmt(diff.value_a), fmt(diff.value_b)))
+                out("%s%s  %s -> %s%s"
+                    % (indent, diff.key.ljust(width),
+                       fmt(diff.value_a), fmt(diff.value_b), note))
             else:
-                out("%s%s  %s" % (indent, diff.key.ljust(width), summary))
+                out("%s%s  %s%s" % (indent, diff.key.ljust(width), summary, note))
 
 
 def tally(diffs):
@@ -573,6 +623,15 @@ def compare(config_a, config_b, out):
             collection = config_b.entities[name].collection
         by_collection[collection].append(name)
 
+    # `@local::` source blocks are defined in included files, so map each
+    # top-level block name to the file that defines it, for provenance notes.
+    bindings = config_a.local_refs | config_b.local_refs
+    block_file = {}
+    for source in (config_a.bases, config_b.bases):
+        for filename, flat in source.items():
+            for key in flat:
+                block_file.setdefault(key.split(".")[0], filename)
+
     for collection in sorted(by_collection):
         names = by_collection[collection]
         section = []
@@ -585,15 +644,50 @@ def compare(config_a, config_b, out):
             for inc in config_a.entities[name].includes
             if inc in config_b.bases
         })
+
+        # ---- @local:: mirror collapse ----
+        # A block defined at `source` and copied to `target` via @local:: shows
+        # the same change at both paths.  Gather every changed key (base and
+        # per-entity), then, from the consumed side, find its source key: when
+        # both changed identically, hide the staging source and annotate the
+        # consumed line with where it came from.  A divergent copy (the ref was
+        # broken by a local pin) fails the value check and stays fully shown.
+        changed_by_key = {}
+        for base in base_names:
+            for diff in diff_psets(config_a.bases[base], config_b.bases[base]):
+                if diff.kind == "changed":
+                    changed_by_key[diff.key] = (diff.value_a, diff.value_b)
+        for name in names:
+            ea, eb = config_a.entities[name], config_b.entities[name]
+            for key in set(ea.local) | set(eb.local):
+                va, vb = ea.local.get(key, MISSING), eb.local.get(key, MISSING)
+                if va is not MISSING and vb is not MISSING and va != vb:
+                    changed_by_key.setdefault(key, (va, vb))
+
+        suppressed = set()      # staging source keys to hide
+        provenance = {}         # consumed key -> "   (via @local::... in file)"
+        for key, transition in changed_by_key.items():
+            source_key, source_path = mirror_source(key, bindings)
+            # `source_key != key` guards same-name bindings (`x: @local::x`),
+            # where the target matches at offset 0 and a key would otherwise
+            # suppress itself -- hiding a real base change with no surviving copy.
+            if source_key and source_key != key \
+                    and changed_by_key.get(source_key) == transition:
+                suppressed.add(source_key)
+                where = block_file.get(source_path.split(".")[0])
+                provenance[key] = "   (via @local::%s%s)" % (
+                    source_path, " in " + where if where else "")
+
         for base in base_names:
             users = [n for n in names if base in config_a.entities[n].includes]
             diffs = diff_psets(config_a.bases[base], config_b.bases[base])
+            diffs = [d for d in diffs if d.key not in suppressed]
             diffs = collapse_subtrees(diffs, config_a.bases[base], config_b.bases[base])
             if not diffs:
                 continue
             section.append(" [base] %s   (applies to %d entit%s unless overridden)"
                            % (base, len(users), "y" if len(users) == 1 else "ies"))
-            render_diffs(diffs, "    ", section.append)
+            render_diffs(diffs, "    ", section.append, provenance)
             section.append("")
             for kind, value in tally(diffs).items():
                 counts[kind] += value
@@ -641,6 +735,8 @@ def compare(config_a, config_b, out):
                         continue
                     raw.append(KeyDiff(key, "a_only", value_a=value_a))
                 elif value_a != value_b:
+                    if key in suppressed:
+                        continue
                     raw.append(KeyDiff(key, "changed", value_a, value_b))
 
             # Collapse wholly one-sided subtrees here too, so a 150-element
@@ -671,12 +767,13 @@ def compare(config_a, config_b, out):
                         continue
                     kind, value_a, value_b, has_base = bucket
                     if kind == "changed":
+                        prov = provenance.get(key, "")
                         summary = summarize_change(value_a, value_b)
                         if summary is None:
-                            section.append("       %s   %s -> %s%s"
-                                           % (who, fmt(value_a), fmt(value_b), flag))
+                            section.append("       %s   %s -> %s%s%s"
+                                           % (who, fmt(value_a), fmt(value_b), flag, prov))
                         else:
-                            section.append("       %s   %s%s" % (who, summary, flag))
+                            section.append("       %s   %s%s%s" % (who, summary, flag, prov))
                     else:
                         value = value_a if kind == "a_only" else value_b
                         other = "B" if kind == "a_only" else "A"
